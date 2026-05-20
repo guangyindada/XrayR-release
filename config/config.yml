@@ -13,18 +13,19 @@ ConnectionConfig:
   DownlinkOnly: 4 # Time limit when the connection is closed after the uplink is closed, Second
   BufferSize: 4 # The internal cache size of each connection, kB
 Nodes:
-  - PanelType: "SSpanel" # Panel type: SSpanel, NewV2board (also works with Xboard), PMpanel, Proxypanel, V2RaySocks, GoV2Panel, BunPanel
+  - PanelType: "NewV2board" # Panel type: SSpanel, NewV2board, PMpanel, Proxypanel, V2RaySocks, GoV2Panel, BunPanel
     ApiConfig:
-      ApiHost: "http://127.0.0.1:668"
-      ApiKey: "123"
-      NodeID: 41
-      NodeType: V2ray # Node type: V2ray, Vmess, Vless, Shadowsocks, Trojan, Shadowsocks-Plugin, Hysteria2, Tuic, AnyTLS, Socks, HTTP
+      ApiHost: "###"
+      ApiKey: "###"
+      NodeID: 1
+      NodeType: Shadowsocks # Node type: V2ray, Vmess, Vless, Shadowsocks, Trojan, Shadowsocks-Plugin
       Timeout: 30 # Timeout for the api request
       EnableVless: false # Enable Vless for V2ray Type
       VlessFlow: "xtls-rprx-vision" # Only support vless
       SpeedLimit: 0 # Mbps, Local settings will replace remote settings, 0 means disable
       DeviceLimit: 0 # Local settings will replace remote settings, 0 means disable
       RuleListPath: # /etc/XrayR/rulelist Path to local rulelist file
+      DisableCustomConfig: false # disable custom config for sspanel
     ControllerConfig:
       ListenIP: 0.0.0.0 # IP address you want to listen
       SendIP: 0.0.0.0 # IP address you want to send pacakage
@@ -53,8 +54,10 @@ Nodes:
           Path: # HTTP PATH, Empty for any
           Dest: 80 # Required, Destination of fallback, check https://xtls.github.io/config/features/fallback.html for details.
           ProxyProtocolVer: 0 # Send PROXY protocol version, 0 for disable
-      EnableREALITY: true # Enable REALITY
+      DisableLocalREALITYConfig: false  # disable local reality config
+      EnableREALITY: false # Enable REALITY
       REALITYConfigs:
+        Show: true # Show REALITY debug
         Dest: www.amazon.com:443 # Required, Same as fallback
         ProxyProtocolVer: 0 # Send PROXY protocol version, 0 for disable
         ServerNames: # Required, list of available serverNames for the client, * wildcard is not supported at the moment.
