@@ -14,6 +14,15 @@ Find the source code here: [XrayR-project/XrayR](https://github.com/XrayR-projec
 ```
 bash <(curl -Ls https://raw.githubusercontent.com/lukexoxo/XrayR-release/master/install.sh)
 ```
+
+# 本地安装
+
+固定安装仓库 `bin/XrayR.zip` 中的 XrayR：
+
+```
+bash <(curl -Ls https://raw.githubusercontent.com/lukexoxo/XrayR-release/master/install-local.sh)
+```
+
 # Docker 安装
 
 ```
