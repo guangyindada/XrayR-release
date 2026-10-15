@@ -115,16 +115,17 @@ install_XrayR() {
         exit 1
     fi
 
-    unzip -o XrayR.zip
+    extract_dir=$(mktemp -d)
+    unzip -o XrayR.zip -d "${extract_dir}"
     rm XrayR.zip -f
-    # zip 内文件在 XrayR/ 目录下，安装目录本身也是 /usr/local/XrayR
-    if [[ -d XrayR ]]; then
-        shopt -s dotglob nullglob
-        mv XrayR/* .
-        shopt -u dotglob nullglob
-        rmdir XrayR
+    # zip 内文件在 XrayR/ 目录下，其中可执行文件也叫 XrayR，不能直接 mv 到同名目录上
+    if [[ -d "${extract_dir}/XrayR" ]]; then
+        cp -a "${extract_dir}/XrayR/." /usr/local/XrayR/
+    else
+        cp -a "${extract_dir}/." /usr/local/XrayR/
     fi
-    chmod +x XrayR
+    rm -rf "${extract_dir}"
+    chmod +x /usr/local/XrayR/XrayR
     mkdir /etc/XrayR/ -p
     rm /etc/systemd/system/XrayR.service -f
     file="https://github.com/lukexoxo/XrayR-release/raw/master/XrayR.service"
