@@ -12,7 +12,7 @@ Find the source code here: [clavin-dev/XrayR](https://github.com/clavin-dev/Xray
 # 一键安装
 
 ```
-bash <(curl -Ls https://raw.githubusercontent.com/clavin-dev/XrayR-release/master/install.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/guangyindada/XrayR-release/master/install.sh)
 ```
 # Docker 安装
 
