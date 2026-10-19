@@ -50,10 +50,23 @@ if (( ${#missing[@]} )); then
   if [[ ${ID:-} == debian && ${VERSION_ID%%.*} == 11 ]]; then
    for i in "${!missing[@]}"; do
     if [[ ${missing[$i]} == unzip ]]; then
-     main_version="$(apt-cache policy unzip | awk '
-       /^[[:space:]]*\*{0,3}[[:space:]]*[0-9][^[:space:]]*[[:space:]]+[0-9]+$/ {version=$1; if (version=="***") version=$2}
-       /deb\.debian\.org\/debian[[:space:]]+bullseye\/main[[:space:]]/ {if (version!="") {print version; exit}}
-     ')"
+     # Parse apt-cache policy by version block, not by a fragile awk pattern.
+     # Only select a version explicitly listed under the official bullseye/main source.
+     main_version="$(python3 - <<'PYAPT'
+import re, subprocess
+p = subprocess.run(['apt-cache', 'policy', 'unzip'], text=True,
+                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+version = ''
+for line in p.stdout.splitlines():
+    m = re.match(r'^\s*(?:\*\*\*\s+)?(\S+)\s+\d+\s*$', line)
+    if m:
+        version = m.group(1)
+        continue
+    if version and re.search(r'https?://deb\.debian\.org/debian\s+bullseye/main\s+', line):
+        print(version)
+        break
+PYAPT
+)"
      if [[ -n "$main_version" ]]; then
       log "Debian 11 主仓库可用 unzip 版本：$main_version；优先安装此版本以避开安全仓库 404"
       missing[$i]="unzip=$main_version"
