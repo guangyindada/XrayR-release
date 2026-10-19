@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# XrayR safe installer for guangyindada/XrayR-release
+# XrayR disk-safe installer for guangyindada/XrayR-release (2026-10-19)
 set -Eeuo pipefail
 umask 022
 RELEASE_REPO="guangyindada/XrayR-release"
@@ -12,11 +12,55 @@ MANAGER=/usr/bin/XrayR
 TMP="$(mktemp -d /tmp/xrayr-install.XXXXXXXX)"
 BACKUP=""
 COMMITTED=0
+DEPLOY_STARTED=0
+WAS_RUNNING=0
+WAS_ENABLED=0
+CREATED_CONFIGS=()
+MOVED_OLD=()
+MOVED_NEW=()
 log(){ printf '[XrayR] %s\n' "$*"; }
 fail(){ printf '[XrayR ERROR] %s\n' "$*" >&2; exit 1; }
-cleanup(){ rm -rf -- "$TMP"; }
-trap cleanup EXIT
-trap 'rc=$?; echo "[XrayR ERROR] 安装失败（退出码 $rc，第 $LINENO 行）。" >&2; exit "$rc"' ERR
+rollback() {
+  log '部署阶段失败，正在恢复原有文件'
+  # Remove new payload first, freeing space before restoring old files.
+  local item
+  for item in "${MOVED_NEW[@]}"; do rm -f -- "$APP/$item" || true; done
+  for item in "${MOVED_OLD[@]}"; do
+    if [[ -e "$BACKUP/$item" ]]; then mv -f -- "$BACKUP/$item" "$APP/$item" || true; fi
+  done
+  for item in "${CREATED_CONFIGS[@]}"; do rm -f -- "$CFG/$item" || true; done
+  if [[ -e "$BACKUP/unit" ]]; then
+    cp -a "$BACKUP/unit" "$UNIT" || true
+  else
+    rm -f -- "$UNIT" || true
+  fi
+  if [[ -e "$BACKUP/manager" ]]; then
+    cp -a "$BACKUP/manager" "$MANAGER" || true
+  else
+    rm -f -- "$MANAGER" || true
+  fi
+  if [[ -e "$BACKUP/lowercase-link" ]]; then
+    cp -a "$BACKUP/lowercase-link" /usr/bin/xrayr || true
+  elif [[ -L /usr/bin/xrayr ]]; then
+    rm -f /usr/bin/xrayr || true
+  fi
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  if (( WAS_ENABLED )); then systemctl enable XrayR >/dev/null 2>&1 || true;
+  else systemctl disable XrayR >/dev/null 2>&1 || true; fi
+  if (( WAS_RUNNING )); then systemctl restart XrayR || true; fi
+  warn_msg="[XrayR] 已尝试回滚。若仍有问题，原文件备份目录：$BACKUP"
+  printf '%s\n' "$warn_msg" >&2
+}
+on_exit() {
+  local rc=$?
+  trap - EXIT
+  if (( rc != 0 && DEPLOY_STARTED && ! COMMITTED )); then rollback; fi
+  [[ -z "${TMP:-}" || ! -d "$TMP" ]] || rm -rf -- "$TMP"
+  if (( rc != 0 )); then
+    printf '[XrayR ERROR] 安装失败（退出码 %s）；未报告部署成功。\n' "$rc" >&2
+  fi
+}
+trap on_exit EXIT
 [[ $EUID -eq 0 ]] || fail '请使用 root 运行'
 command -v systemctl >/dev/null || fail '需要 systemd/systemctl'
 [[ -r /etc/os-release ]] || fail '无法识别操作系统'
@@ -128,8 +172,28 @@ ZIP="XrayR-linux-${ARCH}.zip"
 log "下载 $VERSION ($ARCH)"
 fetch "https://github.com/${CORE_REPO}/releases/download/${VERSION}/${ZIP}" "$TMP/$ZIP"
 unzip -tq "$TMP/$ZIP" >/dev/null || fail 'ZIP 损坏，现有安装未修改'
+# Detect insufficient filesystem capacity BEFORE extraction, rather than halfway
+# through writing the live files. The archive remains untouched until validated.
+python3 - "$TMP/$ZIP" <<'PYSPACE'
+import os, sys, zipfile, shutil
+archive = sys.argv[1]
+with zipfile.ZipFile(archive) as z:
+    files = z.infolist()
+    for info in files:
+        path = info.filename.replace('\\', '/')
+        if path.startswith('/') or '..' in path.split('/'):
+            raise SystemExit('[XrayR ERROR] ZIP 包含不安全路径，已终止')
+    payload = sum(i.file_size for i in files)
+free = shutil.disk_usage(os.path.dirname(archive)).free
+# 16 MiB headroom for metadata and transient file operations.
+required = payload + 16 * 1024 * 1024
+print(f'[XrayR] 解压前空间检查：需要约 {required//1048576} MiB，可用 {free//1048576} MiB')
+if free < required:
+    raise SystemExit('[XrayR ERROR] 临时目录空间不足，未解压、未修改现有安装；请扩容磁盘或清理不需要的文件')
+PYSPACE
 mkdir -p "$TMP/stage"
 unzip -q "$TMP/$ZIP" -d "$TMP/stage"
+rm -f -- "$TMP/$ZIP" # archive is no longer required; reclaim disk space
 BIN="$(find "$TMP/stage" -type f -name XrayR -print -quit)"
 [[ -n "$BIN" && -s "$BIN" ]] || fail '压缩包缺少 XrayR 程序'
 chmod 755 "$BIN"
@@ -160,54 +224,87 @@ for name in geoip.dat geosite.dat; do
  fi
 done
 [[ -s "$CFG/config.yml" || -s "$TMP/defaults/config.yml" ]] || fail '缺少 config.yml'
-# 全部远程下载完成后才开始修改现有安装
-log '下载与预检完成，开始部署'
+# Validate final deployment capacity before touching the live program or service.
+# Same-filesystem mv does not duplicate the binary/geo files. Cross-filesystem mv
+# requires enough free capacity in the destination for a full copy.
+python3 - "$TMP" "$APP" "$BIN" <<'PYDEPLOY'
+import os, shutil, sys
+root, target, binary = sys.argv[1:]
+parent = os.path.dirname(target)
+os.makedirs(parent, exist_ok=True)
+source_paths = [binary]
+for name in ('geoip.dat', 'geosite.dat'):
+    for folder in (os.path.join(root, 'stage'), os.path.join(root, 'defaults')):
+        for dirpath, _, files in os.walk(folder):
+            if name in files:
+                source_paths.append(os.path.join(dirpath, name))
+                break
+        if len(source_paths) >= (2 if name == 'geoip.dat' else 3):
+            break
+source_bytes = sum(os.stat(p).st_size for p in source_paths)
+free = shutil.disk_usage(parent).free
+same_fs = os.stat(root).st_dev == os.stat(parent).st_dev
+reserve = 16 * 1024 * 1024
+required = reserve if same_fs else source_bytes + reserve
+print(f'[XrayR] 部署空间检查：目标目录可用 {free//1048576} MiB；所需至少 {required//1048576} MiB；跨分区={"是" if not same_fs else "否"}')
+if free < required:
+    raise SystemExit('[XrayR ERROR] 目标分区空间不足，尚未修改运行中的程序；请先扩容或清理磁盘')
+PYDEPLOY
+# Never copy potentially huge existing binaries for backup. Rename them on the
+# same filesystem to avoid consuming extra disk space and enable easy rollback.
+log '下载与空间预检完成，开始部署'
 mkdir -p "$APP" "$CFG"
-BACKUP="$(mktemp -d /var/tmp/xrayr-backup.XXXXXXXX)"
-for pair in "$APP/XrayR:binary" "$UNIT:unit" "$MANAGER:manager"; do
- src="${pair%%:*}"; dst="${pair##*:}"
- [[ ! -f "$src" ]] || cp -a "$src" "$BACKUP/$dst"
+BACKUP="$(mktemp -d /usr/local/.xrayr-backup.XXXXXXXX)"
+for pair in "$UNIT:unit" "$MANAGER:manager"; do
+  src="${pair%%:*}"; dst="${pair##*:}"
+  [[ ! -f "$src" ]] || cp -a -- "$src" "$BACKUP/$dst"
 done
-WAS_RUNNING=0
-systemctl is-active --quiet XrayR && WAS_RUNNING=1 || true
+if [[ -L /usr/bin/xrayr ]]; then cp -a /usr/bin/xrayr "$BACKUP/lowercase-link"; fi
+if systemctl is-active --quiet XrayR; then WAS_RUNNING=1; fi
+if systemctl is-enabled --quiet XrayR; then WAS_ENABLED=1; fi
+DEPLOY_STARTED=1
 if (( WAS_RUNNING )); then systemctl stop XrayR; fi
-rollback(){
- log '正在尝试恢复原有程序及服务文件'
- [[ ! -f "$BACKUP/binary" ]] || install -m 755 "$BACKUP/binary" "$APP/XrayR"
- [[ ! -f "$BACKUP/unit" ]] || install -m 644 "$BACKUP/unit" "$UNIT"
- [[ ! -f "$BACKUP/manager" ]] || install -m 755 "$BACKUP/manager" "$MANAGER"
- systemctl daemon-reload || true
- if (( WAS_RUNNING )); then systemctl restart XrayR || true; fi
-}
-trap 'rc=$?; if (( ! COMMITTED )); then rollback; fi; echo "[XrayR ERROR] 部署失败（退出码 $rc），备份目录：$BACKUP" >&2; exit "$rc"' ERR
-install -m 755 "$BIN" "$APP/XrayR"
-for name in geoip.dat geosite.dat; do
- src="$(find "$TMP/stage" -type f -name "$name" -print -quit)"
- [[ -n "$src" ]] || src="$TMP/defaults/$name"
- install -m 644 "$src" "$APP/$name"
+for name in XrayR geoip.dat geosite.dat; do
+  if [[ -e "$APP/$name" ]]; then
+    mv -f -- "$APP/$name" "$BACKUP/$name"
+    MOVED_OLD+=("$name")
+  fi
+  if [[ "$name" == XrayR ]]; then
+    src="$BIN"
+  else
+    src="$(find "$TMP/stage" -type f -name "$name" -print -quit)"
+    [[ -n "$src" ]] || src="$TMP/defaults/$name"
+  fi
+  [[ -s "$src" ]] || fail "缺少部署文件：$name"
+  MOVED_NEW+=("$name") # include interrupted cross-device copies in rollback
+  mv -f -- "$src" "$APP/$name"
 done
+chmod 755 "$APP/XrayR"
+chmod 644 "$APP/geoip.dat" "$APP/geosite.dat"
 for name in config.yml dns.json route.json custom_inbound.json custom_outbound.json; do
- if [[ ! -e "$CFG/$name" && -s "$TMP/defaults/$name" ]]; then
-  install -m 644 "$TMP/defaults/$name" "$CFG/$name"
- fi
+  if [[ ! -e "$CFG/$name" && -s "$TMP/defaults/$name" ]]; then
+    CREATED_CONFIGS+=("$name") # ensure partial writes are removed on rollback
+    install -m 644 "$TMP/defaults/$name" "$CFG/$name"
+  fi
 done
 install -m 644 "$TMP/XrayR.service" "$UNIT"
 install -m 755 "$TMP/XrayR.sh" "$MANAGER"
 ln -sfn "$MANAGER" /usr/bin/xrayr
 systemctl daemon-reload
 systemctl enable XrayR
-# 已运行的服务升级后应恢复运行；首次安装的示例配置不能当成真实配置
+# Preserve the running state of an existing deployment. Do not launch an
+# unconfigured example node on the first install.
 if (( WAS_RUNNING )); then
- systemctl start XrayR
- sleep 2
- systemctl is-active --quiet XrayR || fail '服务重启后未保持运行'
- log '服务已恢复运行：active'
-elif [[ -f "$BACKUP/binary" ]]; then
- log '程序升级完成；原服务未运行，保持原状态'
+  systemctl start XrayR
+  sleep 2
+  systemctl is-active --quiet XrayR || fail '服务重启后未保持运行'
+  log '服务已恢复运行：active'
+elif (( ${#MOVED_OLD[@]} )); then
+  log '程序已更新；原服务未运行，继续保持未运行状态'
 else
- log '首次安装完成。请编辑 /etc/XrayR/config.yml 填写真实节点配置后再启动服务'
+  log '首次安装完成。请编辑 /etc/XrayR/config.yml 填写真实节点配置后再启动服务'
 fi
 systemctl is-enabled --quiet XrayR || fail '开机自启设置失败'
 COMMITTED=1
 log "部署成功：$VERSION；开机自启 enabled"
-log "备份目录：$BACKUP（确认运行正常后可自行删除）"
+log "旧程序备份：$BACKUP（确认运行正常后可自行删除以释放空间）"
