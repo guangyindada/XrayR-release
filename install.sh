@@ -31,18 +31,46 @@ case "$(uname -m)" in
  aarch64|arm64) ARCH=arm64-v8a ;;
  *) fail "当前架构尚未验证：$(uname -m)" ;;
 esac
-if ! command -v curl >/dev/null || ! command -v unzip >/dev/null || ! command -v python3 >/dev/null; then
- log '安装 curl、unzip、python3、ca-certificates'
- if [[ $PKG == apt ]]; then
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update
-  apt-get install -y curl unzip python3 ca-certificates
- elif command -v dnf >/dev/null; then
-  dnf install -y curl unzip python3 ca-certificates
- else
-  yum install -y curl unzip python3 ca-certificates
+# 只安装真正缺失的依赖，避免 Debian 11 安全源旧索引触发不必要的升级。
+missing=()
+for cmd in curl unzip python3; do
+ if ! command -v "$cmd" >/dev/null 2>&1; then missing+=("$cmd"); fi
+done
+if [[ $PKG == apt ]]; then
+ if ! dpkg-query -W -f='${Status}' ca-certificates 2>/dev/null | grep -qx 'install ok installed'; then
+  missing+=(ca-certificates)
  fi
 fi
+if (( ${#missing[@]} )); then
+ log "仅安装缺失的依赖：${missing[*]}"
+ if [[ $PKG == apt ]]; then
+  export DEBIAN_FRONTEND=noninteractive
+  # 先直接安装，避免仅因索引过期就升级已安装的其他软件包。
+  if ! apt-get install -y --no-install-recommends --no-upgrade "${missing[@]}"; then
+   log 'APT 首次安装失败，刷新索引后重试缺失依赖'
+   apt-get update || fail 'APT 索引更新失败'
+   if ! apt-get install -y --no-install-recommends --no-upgrade "${missing[@]}"; then
+    # Debian 11 特殊兜底：bullseye-security 索引可能指向已下架的 unzip 包。
+    # 仅在官方 bullseye 主仓库仍提供该版本时使用，不修改软件源。
+    if [[ ${ID:-} == debian && ${VERSION_ID%%.*} == 11 && ${#missing[@]} == 1 && ${missing[0]} == unzip ]] \
+       && apt-cache policy unzip | grep -Fq '6.0-26+deb11u1'; then
+      log '尝试安装 Debian 11 主仓库提供的 unzip 版本'
+      apt-get install -y --no-install-recommends --no-upgrade 'unzip=6.0-26+deb11u1' \
+        || fail 'unzip 自动安装失败，请检查 Debian 软件源'
+    else
+      fail '依赖安装失败；请检查 APT 软件源，不会继续部署 XrayR'
+    fi
+   fi
+  fi
+ elif command -v dnf >/dev/null 2>&1; then
+  dnf install -y "${missing[@]}"
+ else
+  yum install -y "${missing[@]}"
+ fi
+fi
+for cmd in curl unzip python3; do
+ command -v "$cmd" >/dev/null 2>&1 || fail "缺少依赖：$cmd"
+done
 fetch(){ curl -fL --retry 3 --connect-timeout 15 --max-time 600 -sS "$1" -o "$2"; }
 log '获取最新 release 版本'
 fetch "https://api.github.com/repos/${CORE_REPO}/releases/latest" "$TMP/latest.json"
