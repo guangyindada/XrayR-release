@@ -1,3 +1,67 @@
+#!/usr/bin/env bash
+# XrayR safe installer for guangyindada/XrayR-release
+set -Eeuo pipefail
+umask 022
+RELEASE_REPO="guangyindada/XrayR-release"
+CORE_REPO="Mtoly/XrayRP"
+BASE="https://raw.githubusercontent.com/${RELEASE_REPO}/master"
+APP=/usr/local/XrayR
+CFG=/etc/XrayR
+UNIT=/etc/systemd/system/XrayR.service
+MANAGER=/usr/bin/XrayR
+TMP="$(mktemp -d /tmp/xrayr-install.XXXXXXXX)"
+BACKUP=""
+COMMITTED=0
+log(){ printf '[XrayR] %s\n' "$*"; }
+fail(){ printf '[XrayR ERROR] %s\n' "$*" >&2; exit 1; }
+cleanup(){ rm -rf -- "$TMP"; }
+trap cleanup EXIT
+trap 'rc=$?; echo "[XrayR ERROR] 安装失败（退出码 $rc，第 $LINENO 行）。" >&2; exit "$rc"' ERR
+[[ $EUID -eq 0 ]] || fail '请使用 root 运行'
+command -v systemctl >/dev/null || fail '需要 systemd/systemctl'
+[[ -r /etc/os-release ]] || fail '无法识别操作系统'
+. /etc/os-release
+case "${ID:-}" in
+ debian|ubuntu) PKG=apt ;;
+ centos|rhel|rocky|almalinux|ol|fedora) PKG=rpm ;;
+ *) fail "未验证的发行版：${ID:-unknown}" ;;
+esac
+case "$(uname -m)" in
+ x86_64|amd64) ARCH=64 ;;
+ aarch64|arm64) ARCH=arm64-v8a ;;
+ *) fail "当前架构尚未验证：$(uname -m)" ;;
+esac
+# 只安装真正缺失的依赖，避免 Debian 11 安全源旧索引触发不必要的升级。
+missing=()
+for cmd in curl unzip python3; do
+ if ! command -v "$cmd" >/dev/null 2>&1; then missing+=("$cmd"); fi
+done
+if [[ $PKG == apt ]]; then
+ if ! dpkg-query -W -f='${Status}' ca-certificates 2>/dev/null | grep -qx 'install ok installed'; then
+  missing+=(ca-certificates)
+ fi
+fi
+if (( ${#missing[@]} )); then
+ log "仅安装缺失的依赖：${missing[*]}"
+ if [[ $PKG == apt ]]; then
+  export DEBIAN_FRONTEND=noninteractive
+  # 先直接安装，避免仅因索引过期就升级已安装的其他软件包。
+  if ! apt-get install -y --no-install-recommends --no-upgrade "${missing[@]}"; then
+   log 'APT 首次安装失败，刷新索引后重试缺失依赖'
+   apt-get update || fail 'APT 索引更新失败'
+   if ! apt-get install -y --no-install-recommends --no-upgrade "${missing[@]}"; then
+    # Debian 11: 安全仓库 404 时从 APT 元数据中寻找 bullseye 主仓库版本。
+    # 只针对缺失的 unzip 回退；不改 sources.list，也不升级其他已安装包。
+    if [[ ${ID:-} == debian && ${VERSION_ID%%.*} == 11 && ${#missing[@]} == 1 && ${missing[0]} == unzip ]]; then
+      main_version="$(apt-cache policy unzip | awk '
+        /^[[:space:]]+[0-9][^[:space:]]*[[:space:]]+[0-9]+$/ {version=$1}
+        /deb\.debian\.org\/debian[[:space:]]+bullseye\/main[[:space:]]/ {print version; exit}
+      ')"
+      if [[ -n "$main_version" ]]; then
+        log "安全仓库不可用，尝试 Debian 11 官方主仓库版本：unzip=$main_version"
+        apt-get install -y --no-install-recommends --no-upgrade "unzip=$main_version" \
+          || fail "主仓库 unzip=$main_version 安装失败；停止部署"
+      else
         fail '无法从 APT 元数据找到 bullseye 主仓库的 unzip 版本；停止部署'
       fi
     else
