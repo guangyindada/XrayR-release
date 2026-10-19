@@ -50,23 +50,45 @@ if (( ${#missing[@]} )); then
   if [[ ${ID:-} == debian && ${VERSION_ID%%.*} == 11 ]]; then
    for i in "${!missing[@]}"; do
     if [[ ${missing[$i]} == unzip ]]; then
-     # Parse apt-cache policy by version block, not by a fragile awk pattern.
-     # Only select a version explicitly listed under the official bullseye/main source.
+     # Prefer APT's machine-friendly madison listing, avoiding policy indentation parsing.
+     # Match only Debian bullseye/main, not bullseye-security.
      main_version="$(python3 - <<'PYAPT'
-import re, subprocess
-p = subprocess.run(['apt-cache', 'policy', 'unzip'], text=True,
+import re
+import subprocess
+
+p = subprocess.run(['apt-cache', 'madison', 'unzip'], text=True,
                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-version = ''
 for line in p.stdout.splitlines():
-    m = re.match(r'^\s*(?:\*\*\*\s+)?(\S+)\s+\d+\s*$', line)
-    if m:
-        version = m.group(1)
+    parts = [part.strip() for part in line.split('|')]
+    if len(parts) < 3 or parts[0] != 'unzip':
         continue
-    if version and re.search(r'https?://deb\.debian\.org/debian\s+bullseye/main\s+', line):
+    version, source = parts[1], parts[2]
+    if re.search(r'\b(?:https?://)?deb\.debian\.org/debian\s+bullseye/main\b', source):
         print(version)
         break
 PYAPT
 )"
+     # Some APT builds omit madison sources. Fall back to version blocks in policy.
+     if [[ -z "$main_version" ]]; then
+      main_version="$(python3 - <<'PYAPT'
+import re
+import subprocess
+
+p = subprocess.run(['apt-cache', 'policy', 'unzip'], text=True,
+                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+version = ''
+for line in p.stdout.splitlines():
+    stripped = line.strip()
+    m = re.fullmatch(r'(?:\*\*\*\s+)?([^\s]+)\s+[0-9]+', stripped)
+    if m:
+        version = m.group(1)
+        continue
+    if version and re.search(r'https?://deb\.debian\.org/debian\s+bullseye/main\b', line):
+        print(version)
+        break
+PYAPT
+)"
+     fi
      if [[ -n "$main_version" ]]; then
       log "Debian 11 主仓库可用 unzip 版本：$main_version；优先安装此版本以避开安全仓库 404"
       missing[$i]="unzip=$main_version"
