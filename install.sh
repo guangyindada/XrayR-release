@@ -3,7 +3,8 @@
 set -Eeuo pipefail
 umask 022
 RELEASE_REPO="guangyindada/XrayR-release"
-CORE_REPO="Mtoly/XrayRP"
+CORE_REPO="guangyindada/XrayR"
+DEFAULT_VERSION="0.9.8"
 BASE="https://raw.githubusercontent.com/${RELEASE_REPO}/master"
 APP=/usr/local/XrayR
 CFG=/etc/XrayR
@@ -158,16 +159,23 @@ for cmd in curl unzip python3; do
  command -v "$cmd" >/dev/null 2>&1 || fail "缺少依赖：$cmd"
 done
 fetch(){ curl -fL --retry 3 --connect-timeout 15 --max-time 600 -sS "$1" -o "$2"; }
-log '获取最新 release 版本'
-fetch "https://api.github.com/repos/${CORE_REPO}/releases/latest" "$TMP/latest.json"
-VERSION="$(python3 - "$TMP/latest.json" <<'PY'
+# By default install the explicitly selected, known release. Allow an explicit
+# version as the first argument (used by the XrayR management script), or
+# the special value "latest" to query GitHub when requested.
+VERSION="${1:-${XRAYR_VERSION:-$DEFAULT_VERSION}}"
+if [[ "$VERSION" == latest ]]; then
+ log "查询 ${CORE_REPO} 最新正式 release"
+ fetch "https://api.github.com/repos/${CORE_REPO}/releases/latest" "$TMP/latest.json"
+ VERSION="$(python3 - "$TMP/latest.json" <<'PYTAG'
 import json,sys
 v=json.load(open(sys.argv[1])).get('tag_name','')
-if not v or '/' in v or '..' in v: raise SystemExit('invalid tag_name')
+if not v: raise SystemExit('GitHub release 没有 tag_name')
 print(v)
-PY
+PYTAG
 )"
-[[ -n "$VERSION" ]] || fail '无法解析最新版本'
+fi
+[[ "$VERSION" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]] || fail "不合法的版本号：$VERSION"
+log "核心仓库：${CORE_REPO}；指定版本：${VERSION}"
 ZIP="XrayR-linux-${ARCH}.zip"
 log "下载 $VERSION ($ARCH)"
 fetch "https://github.com/${CORE_REPO}/releases/download/${VERSION}/${ZIP}" "$TMP/$ZIP"
@@ -199,10 +207,30 @@ BIN="$(find "$TMP/stage" -type f -name XrayR -print -quit)"
 chmod 755 "$BIN"
 "$BIN" version >"$TMP/version.txt" 2>&1 || fail '二进制无法执行'
 log "程序验证：$(head -1 "$TMP/version.txt")"
+# Reject a mismatched release before stopping/replacing the running service.
+EXPECTED_VERSION="${VERSION#v}"
+ACTUAL_VERSION="$(awk 'NR==1 {print $2}' "$TMP/version.txt")"
+[[ "$ACTUAL_VERSION" == "$EXPECTED_VERSION" ]] || fail "下载程序版本不匹配：期望 $EXPECTED_VERSION，实际 $ACTUAL_VERSION"
 for name in XrayR.service XrayR.sh; do
  fetch "$BASE/$name" "$TMP/$name"
  [[ -s "$TMP/$name" ]] || fail "$name 下载为空"
 done
+# The upstream management script still defaults to clavin-dev.
+# Patch the installed copy so menu-based install/update uses this fork.
+python3 - "$TMP/XrayR.sh" <<'PYMANAGER'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+s = p.read_text()
+s = s.replace('clavin-dev/XrayR-release', 'guangyindada/XrayR-release')
+s = s.replace('clavin-dev/XrayR', 'guangyindada/XrayR')
+s = s.replace('version="v0.9.41"', 'version="v0.9.8"')
+s = s.replace("grep -q '^#!/bin/bash'", "grep -Eq '^#!(/bin/bash|/usr/bin/env bash)'")
+s = s.replace('输入指定版本(默认最新版): ', '输入指定版本(默认0.9.8，输入latest获取最新版): ')
+if 'guangyindada/XrayR-release' not in s or 'guangyindada/XrayR' not in s:
+    raise SystemExit('管理脚本仓库指向修复失败')
+p.write_text(s)
+PYMANAGER
 bash -n "$TMP/XrayR.sh" || fail '管理脚本语法检查失败'
 grep -q '^\[Service\]' "$TMP/XrayR.service" || fail 'systemd unit 格式异常'
 grep -Fq 'ExecStart=/usr/local/XrayR/XrayR --config /etc/XrayR/config.yml' "$TMP/XrayR.service" || fail 'systemd unit 启动路径不匹配'
