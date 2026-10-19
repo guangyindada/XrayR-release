@@ -45,29 +45,29 @@ if (( ${#missing[@]} )); then
  log "仅安装缺失的依赖：${missing[*]}"
  if [[ $PKG == apt ]]; then
   export DEBIAN_FRONTEND=noninteractive
-  # 先直接安装，避免仅因索引过期就升级已安装的其他软件包。
-  if ! apt-get install -y --no-install-recommends --no-upgrade "${missing[@]}"; then
-   log 'APT 首次安装失败，刷新索引后重试缺失依赖'
-   apt-get update || fail 'APT 索引更新失败'
-   if ! apt-get install -y --no-install-recommends --no-upgrade "${missing[@]}"; then
-    # Debian 11: 安全仓库 404 时从 APT 元数据中寻找 bullseye 主仓库版本。
-    # 只针对缺失的 unzip 回退；不改 sources.list，也不升级其他已安装包。
-    if [[ ${ID:-} == debian && ${VERSION_ID%%.*} == 11 && ${#missing[@]} == 1 && ${missing[0]} == unzip ]]; then
-      main_version="$(apt-cache policy unzip | awk '
-        /^[[:space:]]+[0-9][^[:space:]]*[[:space:]]+[0-9]+$/ {version=$1}
-        /deb\.debian\.org\/debian[[:space:]]+bullseye\/main[[:space:]]/ {print version; exit}
-      ')"
-      if [[ -n "$main_version" ]]; then
-        log "安全仓库不可用，尝试 Debian 11 官方主仓库版本：unzip=$main_version"
-        apt-get install -y --no-install-recommends --no-upgrade "unzip=$main_version" \
-          || fail "主仓库 unzip=$main_version 安装失败；停止部署"
-      else
-        fail '无法从 APT 元数据找到 bullseye 主仓库的 unzip 版本；停止部署'
-      fi
-    else
-      fail '依赖安装失败；请检查 APT 软件源，不会继续部署 XrayR'
+  # Debian 11 的旧安全仓库可能仍提供索引，但对应 .deb 已经返回 404。
+  # 在已知主仓库存在 unzip 的情况下直接选择主仓库版本，避免重复失败。
+  if [[ ${ID:-} == debian && ${VERSION_ID%%.*} == 11 ]]; then
+   for i in "${!missing[@]}"; do
+    if [[ ${missing[$i]} == unzip ]]; then
+     main_version="$(apt-cache policy unzip | awk '
+       /^[[:space:]]*\*{0,3}[[:space:]]*[0-9][^[:space:]]*[[:space:]]+[0-9]+$/ {version=$1; if (version=="***") version=$2}
+       /deb\.debian\.org\/debian[[:space:]]+bullseye\/main[[:space:]]/ {if (version!="") {print version; exit}}
+     ')"
+     if [[ -n "$main_version" ]]; then
+      log "Debian 11 主仓库可用 unzip 版本：$main_version；优先安装此版本以避开安全仓库 404"
+      missing[$i]="unzip=$main_version"
+     else
+      log '未找到主仓库 unzip 版本，改用标准 APT 安装流程'
+     fi
     fi
-   fi
+   done
+  fi
+  if ! apt-get install -y --no-install-recommends --no-upgrade "${missing[@]}"; then
+   log 'APT 安装失败，刷新索引后再尝试一次'
+   apt-get update || fail 'APT 索引更新失败'
+   apt-get install -y --no-install-recommends --no-upgrade "${missing[@]}" \
+    || fail '依赖安装失败；已停止部署 XrayR。请检查 APT 仓库与可用版本'
   fi
  elif command -v dnf >/dev/null 2>&1; then
   dnf install -y "${missing[@]}"
